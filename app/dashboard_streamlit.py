@@ -95,12 +95,19 @@ except OperationalError as e:
                         prod_cols['product_name'] = 'Product Name'
                     dim_product = df_raw[list(prod_cols.values())].drop_duplicates().rename(columns={v: k for k,v in prod_cols.items()})
                     # dim_region
-                    if 'Region' in df_raw.columns:
+                    ### 🔧 dim_region: ưu tiên City nếu có, fallback sang Region
+                    if 'City' in df_raw.columns:
+                        cities = df_raw[['City']].drop_duplicates().reset_index(drop=True)
+                        cities['region_id'] = cities.index + 1
+                        cities = cities.rename(columns={'City': 'region_name'})
+                        dim_region = cities[['region_id', 'region_name']]
+                        # map region_id into fact via City
+                        df_raw = df_raw.merge(dim_region, left_on='City', right_on='region_name', how='left')
+                    elif 'Region' in df_raw.columns:
                         regions = df_raw[['Region']].drop_duplicates().reset_index(drop=True)
                         regions['region_id'] = regions.index + 1
                         regions = regions.rename(columns={'Region':'region_name'})
                         dim_region = regions[['region_id','region_name']]
-                        # map region_id into fact
                         df_raw = df_raw.merge(dim_region, left_on='Region', right_on='region_name', how='left')
                     else:
                         dim_region = pd.DataFrame(columns=['region_id','region_name'])
@@ -185,7 +192,15 @@ except OperationalError as e:
                 if 'Product Name' in df_raw.columns:
                     prod_cols['product_name'] = 'Product Name'
                 dim_product = df_raw[list(prod_cols.values())].drop_duplicates().rename(columns={v: k for k,v in prod_cols.items()})
-                if 'Region' in df_raw.columns:
+                # dim_region
+                ### 🔧 dim_region: ưu tiên City nếu có, fallback sang Region
+                if 'City' in df_raw.columns:
+                    cities = df_raw[['City']].drop_duplicates().reset_index(drop=True)
+                    cities['region_id'] = cities.index + 1
+                    cities = cities.rename(columns={'City': 'region_name'})
+                    dim_region = cities[['region_id', 'region_name']]
+                    df_raw = df_raw.merge(dim_region, left_on='City', right_on='region_name', how='left')
+                elif 'Region' in df_raw.columns:
                     regions = df_raw[['Region']].drop_duplicates().reset_index(drop=True)
                     regions['region_id'] = regions.index + 1
                     regions = regions.rename(columns={'Region':'region_name'})
@@ -243,6 +258,7 @@ except OperationalError as e:
         else:
             # no CSV fallback available; stop silently
             st.stop()
+
 
 # Sidebar navigation with icons, logo, info, and filters
 with st.sidebar:
@@ -482,12 +498,15 @@ if selected == "Khu vực":
             filter_clauses.append(f"d.month = {month}")
         if region != "Tất cả":
             filter_clauses.append(f"r.region_name = '{region}'")
+
         filter_sql = ""
         if filter_clauses:
             filter_sql = "WHERE " + " AND ".join(filter_clauses)
+
         query = f'''
         SELECT r.region_name, SUM(f.amount) AS total_sales
-        FROM fact_sales f JOIN dim_region r ON f.region_id = r.region_id
+        FROM fact_sales f 
+        JOIN dim_region r ON f.region_id = r.region_id
         JOIN dim_date d ON f.date_key = d.date_key
         {filter_sql}
         GROUP BY r.region_name
@@ -496,52 +515,72 @@ if selected == "Khu vực":
     else:
         query = '''
         SELECT r.region_name, SUM(f.amount) AS total_sales
-        FROM fact_sales f JOIN dim_region r ON f.region_id = r.region_id
+        FROM fact_sales f 
+        JOIN dim_region r ON f.region_id = r.region_id
         JOIN dim_date d ON f.date_key = d.date_key
         GROUP BY r.region_name
         ORDER BY total_sales DESC;
         '''
+
     with st.expander("🌍 Doanh thu theo khu vực", expanded=True):
         region_sales = pd.read_sql_query(query, engine)
+
         if region_sales.empty:
             st.info("Không có dữ liệu để hiển thị.")
         else:
             try:
-                # Gom nhóm Other nếu số vùng > TOP_N_REGION
+                # Gom nhóm Other nếu số vùng > 10
                 TOP_N_REGION = 10
                 region_sales_sorted = region_sales.sort_values('total_sales', ascending=False)
-                region_sales_sorted['region_name'] = region_sales_sorted['region_name'].fillna('Không xác định').astype(str)
-                # Tạo tập top_regions: top N cộng 'Other' nếu có
+
+                region_sales_sorted['region_name'] = (
+                    region_sales_sorted['region_name']
+                    .fillna('Không xác định')
+                    .astype(str)
+                )
+
+                # Tạo bảng cho pie chart
                 if len(region_sales_sorted) > TOP_N_REGION:
-                    top_regions = region_sales_sorted.head(TOP_N_REGION).copy()
+                    top_regions = region_sales_sorted.head(TOP_N_REGION)
                     other_sales = region_sales_sorted.iloc[TOP_N_REGION:]['total_sales'].sum()
-                    # đảm bảo cột total_sales có tên đúng và cùng kiểu
-                    other_row = pd.DataFrame([{'region_name': 'Other', 'total_sales': other_sales}])
-                    top_regions = pd.concat([top_regions, other_row], ignore_index=True)
+
+                    top_regions = pd.concat([
+                        top_regions,
+                        pd.DataFrame([{'region_name': 'Other', 'total_sales': other_sales}])
+                    ], ignore_index=True)
                 else:
-                    top_regions = region_sales_sorted.copy()
-                # Hiển thị số lượng thực tế trong tiêu đề (ví dụ Top 4 nếu chỉ có 4 vùng)
-                displayed_n = min(TOP_N_REGION, len(region_sales_sorted))
-                # Biểu đồ cột dựa trên top_regions (không hiển thị toàn bộ dataset khi muốn Top N)
-                plot_df = top_regions.copy()
-                max_show = min(len(plot_df), 20)
-                y_max = max(20000, plot_df['total_sales'].max()*1.1) if not plot_df.empty else 20000
-                chart = alt.Chart(plot_df.head(max_show)).mark_bar().encode(
+                    top_regions = region_sales_sorted
+
+                # Biểu đồ cột
+                max_show = min(len(region_sales_sorted), 20)
+                chart = alt.Chart(region_sales_sorted.head(max_show)).mark_bar().encode(
                     x=alt.X('region_name', sort='-y', title='Khu vực', type='nominal'),
-                    y=alt.Y('total_sales', title='Doanh thu', scale=alt.Scale(domain=[0, y_max]))
+                    y=alt.Y('total_sales', title='Doanh thu',
+                            scale=alt.Scale(domain=[0, max(20000, region_sales_sorted['total_sales'].max()*1.1)]))
                 ).properties(width=40*max_show+100, height=350)
+
                 st.altair_chart(chart, use_container_width=True)
+
             except Exception as e:
                 st.warning(f"Không thể hiển thị biểu đồ: {e}")
-            # Biểu đồ tròn (pie chart)
+
+            # ✅ Biểu đồ tròn (Pie chart top 10 + Other)
             import plotly.express as px
+
             if not top_regions.empty and top_regions['total_sales'].sum() > 0:
-                st.markdown(f"**Top {displayed_n} khu vực theo doanh thu (các vùng còn lại gộp 'Other')**")
-                pie_fig = px.pie(top_regions, names='region_name', values='total_sales',
-                                color_discrete_sequence=px.colors.sequential.Oranges)
+                st.markdown("**Top 10 khu vực theo doanh thu (các vùng còn lại gộp 'Other')**")
+
+                pie_fig = px.pie(
+                    top_regions,
+                    names='region_name',
+                    values='total_sales',
+                    color_discrete_sequence=px.colors.sequential.Oranges
+                )
+
                 st.plotly_chart(pie_fig, use_container_width=True)
             else:
                 st.info("Không có dữ liệu để hiển thị biểu đồ tròn khu vực.")
+
             st.dataframe(region_sales, use_container_width=True)
 if selected == "Phân khúc":
     if filter_submit:
