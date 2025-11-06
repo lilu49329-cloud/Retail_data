@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_option_menu import option_menu
@@ -29,8 +30,219 @@ if not Path(config_path).exists():
     st.stop()
 with open(config_path, encoding='utf-8') as f:
     cfg = json.load(f)
-engine_url = f"postgresql+psycopg2://{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg['port']}/{cfg['database']}"
-engine = create_engine(engine_url)
+
+# Cho phép override cấu hình bằng biến môi trường (tiện cho devcontainer/.env)
+cfg['host'] = os.environ.get('PGHOST', cfg.get('host'))
+cfg['port'] = int(os.environ.get('PGPORT', cfg.get('port')))
+cfg['user'] = os.environ.get('PGUSER', cfg.get('user'))
+cfg['password'] = os.environ.get('PGPASSWORD', cfg.get('password'))
+cfg['database'] = os.environ.get('PGDATABASE', cfg.get('database'))
+
+def _make_engine_from_cfg(c):
+    return create_engine(f"postgresql+psycopg2://{c['user']}:{c['password']}@{c['host']}:{c['port']}/{c['database']}")
+
+engine = _make_engine_from_cfg(cfg)
+
+# Thử kết nối sớm để bắt lỗi rõ ràng và (nếu phù hợp) tự động thử fallback sang host.docker.internal
+from sqlalchemy.exc import OperationalError
+tried_hosts = [cfg['host']]
+try:
+    conn = engine.connect()
+    conn.close()
+except OperationalError as e:
+    # Nếu host là localhost/127.0.0.1 có thể DB chạy trên máy host; thử host.docker.internal
+    alt_host = None
+    if str(cfg.get('host')).lower() in ('localhost', '127.0.0.1'):
+        alt_host = 'host.docker.internal'
+    if alt_host:
+        # silent: try alternative host (e.g., host.docker.internal) without printing diagnostics
+        # thử với host.docker.internal
+        cfg_alt = cfg.copy()
+        cfg_alt['host'] = alt_host
+        tried_hosts.append(alt_host)
+        try:
+            engine = _make_engine_from_cfg(cfg_alt)
+            conn = engine.connect()
+            conn.close()
+            # use alt host silently
+            cfg = cfg_alt
+        except OperationalError:
+            # couldn't connect to either host; fall back to CSV/SQLite if available (silent)
+            # Thử fallback: nếu có file data/train.csv, sinh SQLite DB từ CSV và dùng làm engine thay thế
+            csv_path = Path('data/train.csv')
+            if csv_path.exists():
+                try:
+                    df_raw = pd.read_csv(csv_path)
+                    # Chuẩn hoá cột ngày
+                    if 'Order Date' in df_raw.columns:
+                        df_raw['Order Date'] = pd.to_datetime(df_raw['Order Date'], errors='coerce', dayfirst=False)
+                    # Tạo date_key dạng YYYYMMDD integer cho join
+                    df_raw['date_key'] = df_raw['Order Date'].dt.strftime('%Y%m%d').astype('Int64')
+                    # dim_date
+                    dim_date = df_raw[['date_key', 'Order Date']].drop_duplicates().copy()
+                    dim_date['year'] = dim_date['Order Date'].dt.year
+                    dim_date['month'] = dim_date['Order Date'].dt.month
+                    dim_date['month_name'] = dim_date['Order Date'].dt.month_name()
+                    dim_date['quarter'] = dim_date['Order Date'].dt.quarter
+                    dim_date = dim_date[['date_key', 'year', 'month', 'month_name', 'quarter']]
+                    # dim_product
+                    prod_cols = {}
+                    if 'Product ID' in df_raw.columns:
+                        prod_cols['product_id'] = 'Product ID'
+                    if 'Category' in df_raw.columns:
+                        prod_cols['category'] = 'Category'
+                    if 'Product Name' in df_raw.columns:
+                        prod_cols['product_name'] = 'Product Name'
+                    dim_product = df_raw[list(prod_cols.values())].drop_duplicates().rename(columns={v: k for k,v in prod_cols.items()})
+                    # dim_region
+                    if 'Region' in df_raw.columns:
+                        regions = df_raw[['Region']].drop_duplicates().reset_index(drop=True)
+                        regions['region_id'] = regions.index + 1
+                        regions = regions.rename(columns={'Region':'region_name'})
+                        dim_region = regions[['region_id','region_name']]
+                        # map region_id into fact
+                        df_raw = df_raw.merge(dim_region, left_on='Region', right_on='region_name', how='left')
+                    else:
+                        dim_region = pd.DataFrame(columns=['region_id','region_name'])
+                    # dim_customer
+                    cust_cols = {}
+                    if 'Customer ID' in df_raw.columns:
+                        cust_cols['customer_id'] = 'Customer ID'
+                    if 'Customer Name' in df_raw.columns:
+                        cust_cols['customer_name'] = 'Customer Name'
+                    if 'Segment' in df_raw.columns:
+                        cust_cols['segment'] = 'Segment'
+                    dim_customer = df_raw[list(cust_cols.values())].drop_duplicates().rename(columns={v: k for k,v in cust_cols.items()})
+                    # fact_sales: amount from Sales column
+                    sales_col = None
+                    for candidate in ['Sales','Amount','amount','sales']:
+                        if candidate in df_raw.columns:
+                            sales_col = candidate
+                            break
+                    fact_sales = pd.DataFrame()
+                    fact_sales['date_key'] = df_raw['date_key']
+                    # detect quantity column in source CSV (common names); default to 1 when absent
+                    quantity_col = None
+                    for q_candidate in ['Quantity', 'quantity', 'Qty', 'qty', 'Units', 'Units Sold', 'Order Quantity']:
+                        if q_candidate in df_raw.columns:
+                            quantity_col = q_candidate
+                            break
+                    if quantity_col:
+                        fact_sales['quantity'] = df_raw[quantity_col]
+                    else:
+                        fact_sales['quantity'] = 1
+                    # product id
+                    if 'Product ID' in df_raw.columns:
+                        fact_sales['product_id'] = df_raw['Product ID']
+                    # customer
+                    if 'Customer ID' in df_raw.columns:
+                        fact_sales['customer_id'] = df_raw['Customer ID']
+                    # region_id
+                    if 'region_id' in df_raw.columns:
+                        fact_sales['region_id'] = df_raw['region_id']
+                    # amount
+                    if sales_col:
+                        fact_sales['amount'] = df_raw[sales_col]
+                    else:
+                        fact_sales['amount'] = 0
+
+                    # Ghi các bảng vào SQLite file DB
+                    sqlite_path = Path('data/dev_fallback.db')
+                    sqlite_url = f"sqlite:///{sqlite_path.resolve()}"
+                    sqlite_engine = create_engine(sqlite_url)
+                    dim_date.to_sql('dim_date', sqlite_engine, if_exists='replace', index=False)
+                    dim_product.to_sql('dim_product', sqlite_engine, if_exists='replace', index=False)
+                    dim_region.to_sql('dim_region', sqlite_engine, if_exists='replace', index=False)
+                    dim_customer.to_sql('dim_customer', sqlite_engine, if_exists='replace', index=False)
+                    fact_sales.to_sql('fact_sales', sqlite_engine, if_exists='replace', index=False)
+                    engine = sqlite_engine
+                except Exception:
+                    # unable to parse CSV fallback; stop silently
+                    st.stop()
+            else:
+                # no CSV fallback available; stop silently
+                st.stop()
+    else:
+        # no alternative host to try; attempt CSV fallback silently
+        csv_path = Path('data/train.csv')
+        if csv_path.exists():
+            try:
+                df_raw = pd.read_csv(csv_path)
+                if 'Order Date' in df_raw.columns:
+                    df_raw['Order Date'] = pd.to_datetime(df_raw['Order Date'], errors='coerce', dayfirst=False)
+                df_raw['date_key'] = df_raw['Order Date'].dt.strftime('%Y%m%d').astype('Int64')
+                dim_date = df_raw[['date_key', 'Order Date']].drop_duplicates().copy()
+                dim_date['year'] = dim_date['Order Date'].dt.year
+                dim_date['month'] = dim_date['Order Date'].dt.month
+                dim_date['month_name'] = dim_date['Order Date'].dt.month_name()
+                dim_date['quarter'] = dim_date['Order Date'].dt.quarter
+                dim_date = dim_date[['date_key', 'year', 'month', 'month_name', 'quarter']]
+                prod_cols = {}
+                if 'Product ID' in df_raw.columns:
+                    prod_cols['product_id'] = 'Product ID'
+                if 'Category' in df_raw.columns:
+                    prod_cols['category'] = 'Category'
+                if 'Product Name' in df_raw.columns:
+                    prod_cols['product_name'] = 'Product Name'
+                dim_product = df_raw[list(prod_cols.values())].drop_duplicates().rename(columns={v: k for k,v in prod_cols.items()})
+                if 'Region' in df_raw.columns:
+                    regions = df_raw[['Region']].drop_duplicates().reset_index(drop=True)
+                    regions['region_id'] = regions.index + 1
+                    regions = regions.rename(columns={'Region':'region_name'})
+                    dim_region = regions[['region_id','region_name']]
+                    df_raw = df_raw.merge(dim_region, left_on='Region', right_on='region_name', how='left')
+                else:
+                    dim_region = pd.DataFrame(columns=['region_id','region_name'])
+                cust_cols = {}
+                if 'Customer ID' in df_raw.columns:
+                    cust_cols['customer_id'] = 'Customer ID'
+                if 'Customer Name' in df_raw.columns:
+                    cust_cols['customer_name'] = 'Customer Name'
+                if 'Segment' in df_raw.columns:
+                    cust_cols['segment'] = 'Segment'
+                dim_customer = df_raw[list(cust_cols.values())].drop_duplicates().rename(columns={v: k for k,v in cust_cols.items()})
+                sales_col = None
+                for candidate in ['Sales','Amount','amount','sales']:
+                    if candidate in df_raw.columns:
+                        sales_col = candidate
+                        break
+                fact_sales = pd.DataFrame()
+                fact_sales['date_key'] = df_raw['date_key']
+                # detect quantity column in source CSV (common names); default to 1 when absent
+                quantity_col = None
+                for q_candidate in ['Quantity', 'quantity', 'Qty', 'qty', 'Units', 'Units Sold', 'Order Quantity']:
+                    if q_candidate in df_raw.columns:
+                        quantity_col = q_candidate
+                        break
+                if quantity_col:
+                    fact_sales['quantity'] = df_raw[quantity_col]
+                else:
+                    fact_sales['quantity'] = 1
+                if 'Product ID' in df_raw.columns:
+                    fact_sales['product_id'] = df_raw['Product ID']
+                if 'Customer ID' in df_raw.columns:
+                    fact_sales['customer_id'] = df_raw['Customer ID']
+                if 'region_id' in df_raw.columns:
+                    fact_sales['region_id'] = df_raw['region_id']
+                if sales_col:
+                    fact_sales['amount'] = df_raw[sales_col]
+                else:
+                    fact_sales['amount'] = 0
+                sqlite_path = Path('data/dev_fallback.db')
+                sqlite_url = f"sqlite:///{sqlite_path.resolve()}"
+                sqlite_engine = create_engine(sqlite_url)
+                dim_date.to_sql('dim_date', sqlite_engine, if_exists='replace', index=False)
+                dim_product.to_sql('dim_product', sqlite_engine, if_exists='replace', index=False)
+                dim_region.to_sql('dim_region', sqlite_engine, if_exists='replace', index=False)
+                dim_customer.to_sql('dim_customer', sqlite_engine, if_exists='replace', index=False)
+                fact_sales.to_sql('fact_sales', sqlite_engine, if_exists='replace', index=False)
+                engine = sqlite_engine
+            except Exception:
+                # CSV fallback failed; stop silently
+                st.stop()
+        else:
+            # no CSV fallback available; stop silently
+            st.stop()
 
 # Sidebar navigation with icons, logo, info, and filters
 with st.sidebar:
@@ -295,24 +507,28 @@ if selected == "Khu vực":
             st.info("Không có dữ liệu để hiển thị.")
         else:
             try:
-                # Gom nhóm Other nếu số vùng > 10
+                # Gom nhóm Other nếu số vùng > TOP_N_REGION
                 TOP_N_REGION = 10
                 region_sales_sorted = region_sales.sort_values('total_sales', ascending=False)
                 region_sales_sorted['region_name'] = region_sales_sorted['region_name'].fillna('Không xác định').astype(str)
-                max_show = min(len(region_sales_sorted), 20)
+                # Tạo tập top_regions: top N cộng 'Other' nếu có
                 if len(region_sales_sorted) > TOP_N_REGION:
-                    top_regions = region_sales_sorted.head(TOP_N_REGION)
+                    top_regions = region_sales_sorted.head(TOP_N_REGION).copy()
                     other_sales = region_sales_sorted.iloc[TOP_N_REGION:]['total_sales'].sum()
-                    top_regions = pd.concat([
-                        top_regions,
-                        pd.DataFrame([{'region_name': 'Other', 'total_sales': other_sales}])
-                    ], ignore_index=True)
+                    # đảm bảo cột total_sales có tên đúng và cùng kiểu
+                    other_row = pd.DataFrame([{'region_name': 'Other', 'total_sales': other_sales}])
+                    top_regions = pd.concat([top_regions, other_row], ignore_index=True)
                 else:
-                    top_regions = region_sales_sorted
-                # Biểu đồ cột
-                chart = alt.Chart(region_sales_sorted.head(max_show)).mark_bar().encode(
+                    top_regions = region_sales_sorted.copy()
+                # Hiển thị số lượng thực tế trong tiêu đề (ví dụ Top 4 nếu chỉ có 4 vùng)
+                displayed_n = min(TOP_N_REGION, len(region_sales_sorted))
+                # Biểu đồ cột dựa trên top_regions (không hiển thị toàn bộ dataset khi muốn Top N)
+                plot_df = top_regions.copy()
+                max_show = min(len(plot_df), 20)
+                y_max = max(20000, plot_df['total_sales'].max()*1.1) if not plot_df.empty else 20000
+                chart = alt.Chart(plot_df.head(max_show)).mark_bar().encode(
                     x=alt.X('region_name', sort='-y', title='Khu vực', type='nominal'),
-                    y=alt.Y('total_sales', title='Doanh thu', scale=alt.Scale(domain=[0, max(20000, region_sales_sorted['total_sales'].max()*1.1)]))
+                    y=alt.Y('total_sales', title='Doanh thu', scale=alt.Scale(domain=[0, y_max]))
                 ).properties(width=40*max_show+100, height=350)
                 st.altair_chart(chart, use_container_width=True)
             except Exception as e:
@@ -320,7 +536,7 @@ if selected == "Khu vực":
             # Biểu đồ tròn (pie chart)
             import plotly.express as px
             if not top_regions.empty and top_regions['total_sales'].sum() > 0:
-                st.markdown(f"**Top {TOP_N_REGION} khu vực theo doanh thu (các vùng còn lại gộp 'Other')**")
+                st.markdown(f"**Top {displayed_n} khu vực theo doanh thu (các vùng còn lại gộp 'Other')**")
                 pie_fig = px.pie(top_regions, names='region_name', values='total_sales',
                                 color_discrete_sequence=px.colors.sequential.Oranges)
                 st.plotly_chart(pie_fig, use_container_width=True)
